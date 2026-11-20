@@ -12,6 +12,7 @@
 #include "boilerplate/Sensors/SensorManager/SensorManager.h"
 
 #include "logging.h"
+#include "StateMachineConstants.h"
 
 #include "LoRaE22.h"
 #include "RadioConfig.h"
@@ -352,12 +353,14 @@ void setup() {
   (*initFuncs[ctx.currentState])(&data);
 
   const auto &lsm6_desc = ctx.lsm.get_descriptor();
+  const auto &mag_desc = ctx.mag.get_descriptor(); 
   const auto &baro_desc = ctx.baro.get_descriptor();
 
   // Initialize 
   BLA::Matrix<3, 1> accelVec = {lsm6_desc.data.accel0, lsm6_desc.data.accel1, lsm6_desc.data.accel2};
-  BLA::Matrix<3, 1> gyroVec = {lsm6_desc.data.gyr0, lsm6_desc.data.gyr1, lsm6_desc.data.gyr2};
-  simpleEstimator.initialize(accelVec, gyroVec, baro_desc.data.pressure);
+  BLA::Matrix<3, 1> magVec = {mag_desc.data.mag0, mag_desc.data.mag1, mag_desc.data.mag2};
+  // LPS22 pressure is in hPa, the estimator wants Pa
+  simpleEstimator.initialize(accelVec, magVec, baro_desc.data.pressure * 100.0f);
 
   
 
@@ -367,14 +370,35 @@ void setup() {
 
 void estimatorLoop(Context *ctx) {
   const auto &lsm6_desc = ctx->lsm.get_descriptor();
-  BLA::Matrix<3, 1> gyroVec = {lsm6_desc.data.gyr0, lsm6_desc.data.gyr1, lsm6_desc.data.gyr2};
+  // LSM6 gyro is in deg/s, the estimator wants rad/s
+  BLA::Matrix<3, 1> gyroVec = {lsm6_desc.data.gyr0 * DEG_TO_RAD, lsm6_desc.data.gyr1 * DEG_TO_RAD, lsm6_desc.data.gyr2 * DEG_TO_RAD};
 
   if(ctx->currentState == PRELAUNCH) {
     simpleEstimator.initialize_loop(gyroVec);
-    ctx->lastEstimatorUpdateTime = 0;
-  } else {
-    simpleEstimator.flight_loop(gyroVec, millis() - ctx->lastEstimatorUpdateTime);
+    // so the first flight_loop dt is one loop, not the whole time on the pad
     ctx->lastEstimatorUpdateTime = millis();
+  } else {
+    simpleEstimator.flight_loop(gyroVec, (millis() - ctx->lastEstimatorUpdateTime) / 1000.0f);
+    ctx->lastEstimatorUpdateTime = millis();
+  }
+}
+
+// Riemann sum of the axial (+Z, nose) accel minus gravity from launch.
+// TODO: assumes near-vertical flight; use g*cos(tilt) instead of g
+void velocityLoop(Context *ctx) {
+  const auto &asm330_desc = ctx->asm330.get_descriptor();
+  const uint32_t t = asm330_desc.getLastUpdated();
+
+  if (ctx->currentState == PRELAUNCH) {
+    ctx->axialVelocity = 0;
+    ctx->lastVelocityUpdateTime = t;
+    return;
+  }
+
+  if (t != ctx->lastVelocityUpdateTime) {
+    const float dt = (t - ctx->lastVelocityUpdateTime) / 1000.0f;
+    ctx->axialVelocity += (asm330_desc.data.accel2 - GRAVITY_MPS2) * dt;
+    ctx->lastVelocityUpdateTime = t;
   }
 }
 
@@ -397,6 +421,7 @@ void loop() {
   sensorLoop();
 
   estimatorLoop(&ctx);
+  velocityLoop(&ctx);
 
   // radioLoop();
   loggingLoop(&ctx);

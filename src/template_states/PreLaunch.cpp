@@ -63,10 +63,10 @@ StateID prelaunchLoop(StateData const *data, Context *ctx, void *_localData) {
   //        }
   //    }
 
-  const auto acc_vec = ctx->estimator.get_accel_prev();
-  // check acceleration in vertical direction is greater than threshold
-  if (localData->accelDebouncer.update(abs(acc_vec(0, 0)) > LAUNCH_TRHESHOLD, data->currentTime)) {
-    return BOOST;
+  // the EKF (ctx->estimator) isn't running, so use the raw ASM330 accel
+  // along the nose (+Z, m/s^2); LAUNCH_TRHESHOLD is in g
+  if (localData->accelDebouncer.update(accel_desc.data.accel2 > LAUNCH_TRHESHOLD * GRAVITY_MPS2, data->currentTime)) {
+    return PRECANARDS;
   }
 
   return PRELAUNCH;

@@ -61,4 +61,8 @@ struct Context {
     SplitStateEstimator estimator;
 
     float lastEstimatorUpdateTime;
+
+    // velocity along the nose (+Z) [m/s], Riemann sum of ASM330 accel since launch
+    float axialVelocity = 0;
+    uint32_t lastVelocityUpdateTime = 0;
 };
