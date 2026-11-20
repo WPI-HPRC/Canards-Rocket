@@ -12,9 +12,14 @@
 #include "boilerplate/Sensors/SensorManager/SensorManager.h"
 
 #include "logging.h"
+#include "StateMachineConstants.h"
 
 #include "LoRaE22.h"
 #include "RadioConfig.h"
+
+#include "boilerplate/StateExtimator/simple_estimator.h"
+
+SimpleEstimator simpleEstimator = SimpleEstimator();
 
 SPIClass SENSORS_SPI(SENSORS_SPI_MOSI, SENSORS_SPI_MISO, SENSORS_SPI_SCK);
 TwoWire GPS_I2C(GPS_I2C_SDA, GPS_I2C_SCL);
@@ -310,27 +315,12 @@ void sensorLoop() {
   // Update all sensors through manager
   mgr.loop();
 
-  /*
-  if (currentState >= PRELAUNCH) {
-      return;
-  }
-  */
-
-  // static uint32_t lastBaroReadTime = 0;
-
-  // const auto &baro_desc = ctx.baro.get_descriptor();
-  // if (baro_desc.getLastUpdated() > lastBaroReadTime) {
-  //   lastBaroReadTime = baro_desc.getLastUpdated();
-  //   Log.infoln("LPS22 - Pressure: %F hPa, Temp: %F C",
-  //              baro_desc.data.pressure, baro_desc.data.temp);
-  // }
-  
-
   if (millis() - last_print > 200) {
     digitalWrite(LED_BLUE, !digitalRead(LED_BLUE));
     last_print = millis();
     loop_count++;
 
+#ifdef DEBUG
     Log.infoln("=== Loop %d ===", loop_count);
     Serial.println("upload test build " __DATE__ " " __TIME__);
     if (loop_count % 25 == 0) {
@@ -397,6 +387,7 @@ void sensorLoop() {
     }
 
     Log.infoln("======================\n");
+#endif
   }
 }
 
@@ -438,13 +429,7 @@ void setup() {
   ctx.ekfLooping = false;
   ctx.sdInitialized = initializeLogging(&ctx);
 
-#if DEBUG_MODE == 0
-  Log.begin(LOG_LEVEL_INFO, &ctx.debugLogFile);
-#elif DEBUG_MODE == 1
   Log.begin(LOG_LEVEL_INFO, &Serial);
-#else
-  Log.begin(LOG_LEVEL_TRACE, &Serial);
-#endif
   Log.setPrefix([](Print *p, int level) { p->printf("[ %d ] ", millis()); });
 
   sensorsSetup();
@@ -453,86 +438,54 @@ void setup() {
   initStateData(&data);
   (*initFuncs[ctx.currentState])(&data);
 
-  // ctx.estimator = SplitStateEstimator();
+  const auto &lsm6_desc = ctx.lsm.get_descriptor();
+  const auto &mag_desc = ctx.mag.get_descriptor(); 
+  const auto &baro_desc = ctx.baro.get_descriptor();
 
-  BLA::Matrix<3, 1> ecef = {0, 0, 0};
-  // ctx.estimator.init(ecef, millis());
+  // Initialize 
+  BLA::Matrix<3, 1> accelVec = {lsm6_desc.data.accel0, lsm6_desc.data.accel1, lsm6_desc.data.accel2};
+  BLA::Matrix<3, 1> magVec = {mag_desc.data.mag0, mag_desc.data.mag1, mag_desc.data.mag2};
+  // LPS22 pressure is in hPa, the estimator wants Pa
+  simpleEstimator.initialize(accelVec, magVec, baro_desc.data.pressure * 100.0f);
+
+  
 
   digitalWrite(LED_GREEN, HIGH);
   Log.infoln("=== Starting main loop ===\n");
 }
 
-void ekfLoop(Context *ctx) {
-  static uint32_t last_accel_time = 0;
-  static uint32_t last_mag_time = 0;
-  static uint32_t last_gps_time = 0;
-  static uint32_t last_baro_time = 0;
+void estimatorLoop(Context *ctx) {
+  const auto &lsm6_desc = ctx->lsm.get_descriptor();
+  // LSM6 gyro is in deg/s, the estimator wants rad/s
+  BLA::Matrix<3, 1> gyroVec = {lsm6_desc.data.gyr0 * DEG_TO_RAD, lsm6_desc.data.gyr1 * DEG_TO_RAD, lsm6_desc.data.gyr2 * DEG_TO_RAD};
 
-  uint32_t now = millis();
-
-  const auto &asm330_desc = ctx->asm330.get_descriptor();
-  const auto &baro_desc = ctx->baro.get_descriptor();
-  const auto &mag_desc = ctx->mag.get_descriptor();
-  const auto &gps_desc = ctx->gps.get_descriptor();
-
-  bool inAir = ctx->currentState == BOOST || ctx->currentState == COAST ||
-               ctx->currentState == DROGUE_DESCENT || ctx->currentState == MAIN_DESCENT;
-
-  // Accel and gyro becuase they are on the same sensor
-  if (asm330_desc.getLastUpdated() > last_accel_time) {
-    BLA::Matrix<3, 1> gyro = {asm330_desc.data.gyr0, asm330_desc.data.gyr1,
-                              asm330_desc.data.gyr2};
-    ctx->estimator.fastGyroProp(gyro, now);
-
-    BLA::Matrix<3, 1> accel = {asm330_desc.data.accel0, asm330_desc.data.accel1,
-                               asm330_desc.data.accel2};
-    ctx->estimator.fastAccelProp(accel, now);
-  }
-
-  if (inAir) {
-    if (baro_desc.getLastUpdated() > last_baro_time ||
-        mag_desc.getLastUpdated() > last_mag_time ||
-        gps_desc.getLastUpdated() > last_gps_time) {
-      ctx->estimator.PVekfPredict(now);
-    }
+  if(ctx->currentState == PRELAUNCH) {
+    simpleEstimator.initialize_loop(gyroVec);
+    // so the first flight_loop dt is one loop, not the whole time on the pad
+    ctx->lastEstimatorUpdateTime = millis();
   } else {
-    if (asm330_desc.getLastUpdated() > last_accel_time ||
-        baro_desc.getLastUpdated() > last_baro_time ||
-        mag_desc.getLastUpdated() > last_mag_time ||
-        gps_desc.getLastUpdated() > last_gps_time) {
-      ctx->estimator.PVekfPredict(now);
-    }
+    simpleEstimator.flight_loop(gyroVec, (millis() - ctx->lastEstimatorUpdateTime) / 1000.0f);
+    ctx->lastEstimatorUpdateTime = millis();
+  }
+}
+
+// Riemann sum of the axial (+Z, nose) accel minus gravity from launch.
+// TODO: assumes near-vertical flight; use g*cos(tilt) instead of g
+void velocityLoop(Context *ctx) {
+  const auto &asm330_desc = ctx->asm330.get_descriptor();
+  const uint32_t t = asm330_desc.getLastUpdated();
+
+  if (ctx->currentState == PRELAUNCH) {
+    ctx->axialVelocity = 0;
+    ctx->lastVelocityUpdateTime = t;
+    return;
   }
 
-  if (asm330_desc.getLastUpdated() > last_accel_time) {
-    last_accel_time = asm330_desc.getLastUpdated();
-    BLA::Matrix<3, 1> accel = {asm330_desc.data.accel0, asm330_desc.data.accel1,
-                               asm330_desc.data.accel2};
-    ctx->estimator.runAccelUpdate(accel, now);
+  if (t != ctx->lastVelocityUpdateTime) {
+    const float dt = (t - ctx->lastVelocityUpdateTime) / 1000.0f;
+    ctx->axialVelocity += (asm330_desc.data.accel2 - GRAVITY_MPS2) * dt;
+    ctx->lastVelocityUpdateTime = t;
   }
-
-  if (baro_desc.getLastUpdated() > last_baro_time) {
-    last_baro_time = baro_desc.getLastUpdated();
-    BLA::Matrix<1, 1> baro = {baro_desc.data.pressure};
-    ctx->estimator.runBaroUpdate(baro, now);
-    ctx->estimator.set_curr_temp(baro_desc.data.temp);
-  }
-
-  if (mag_desc.getLastUpdated() > last_mag_time) {
-    last_mag_time = mag_desc.getLastUpdated();
-    BLA::Matrix<3, 1> mag = {mag_desc.data.mag0, mag_desc.data.mag1,
-                             mag_desc.data.mag2};
-    ctx->estimator.runMagUpdate(mag, now);
-  }
-
-  // if (gps_desc.getLastUpdated() > last_gps_time)
-  // {
-  //     last_gps_time = gps_desc.getLastUpdated();
-  //     BLA::Matrix<3, 1> gpsPos = {gps_desc.data.ecefX, gps_desc.data.ecefY,
-  //     gps_desc.data.ecefZ}; BLA::Matrix<3, 1> gpsVel = {gps_desc.data.velN,
-  //     gps_desc.data.velE, gps_desc.data.velD};
-  //     ctx->estimator.runGPSUpdate(gpsPos, gpsVel, false, now);
-  // }
 }
 
 StateID applyCommandEffects(StateID proposedState) {
@@ -579,11 +532,9 @@ void loop() {
 
   sensorLoop();
 
+  estimatorLoop(&ctx);
+  velocityLoop(&ctx);
+
   radioLoop();
-
-  if (false && ctx.ekfLooping) {
-    ekfLoop(&ctx);
-  }
-
   loggingLoop(&ctx);
 }

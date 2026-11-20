@@ -1,6 +1,6 @@
 #pragma once
 
-#include <STM32SD.h>
+#include <SdFat.h>
 #include <Servo.h>
 
 #ifdef __has_include
@@ -51,9 +51,9 @@ struct RemoteCommandState {
 };
 
 struct Context {
-    File logFile;
-    File debugLogFile;
-    File ekfLogFile;
+    FsFile logFile;
+    FsFile debugLogFile;
+    FsFile ekfLogFile;
 
     uint8_t logFileIdx;
     char logFileBuffer[LOG_FILE_BUFFER_SIZE];
@@ -76,5 +76,9 @@ struct Context {
 
     SplitStateEstimator estimator;
 
-    uint32_t liveVideoStart;
+    float lastEstimatorUpdateTime;
+
+    // velocity along the nose (+Z) [m/s], Riemann sum of ASM330 accel since launch
+    float axialVelocity = 0;
+    uint32_t lastVelocityUpdateTime = 0;
 };
