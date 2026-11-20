@@ -128,14 +128,100 @@ void radioInit() {
   Log.infoln("radio init done, code: %d", code);
 }
 
+// apply remote commands, one shots are reset after exec
+void applyRemoteCommand(hprc::Command command) {
+  switch (command) {
+  case hprc::Command_ArmFlight:
+    Log.infoln("Arm flag set");
+    ctx.commands.armed = true;
+    break;
+  case hprc::Command_DeArmFlight:
+    Log.infoln("Dearmed flag set");
+    ctx.commands.armed = false;
+    break;
+  case hprc::Command_Reset:
+    Log.infoln("Reset flag set");
+    ctx.commands.resetRequested = true;
+    break;
+  case hprc::Command_RemoteStartOn:
+    Log.infoln("Remote start on flag set");
+    ctx.commands.remoteStartActive = true;
+    ctx.liveVideoStart = millis();
+    digitalWrite(MOSFET_GATE, HIGH);
+    break;
+  case hprc::Command_RemoteStartOff:
+    Log.infoln("Remote start off flag set");
+    ctx.commands.remoteStartActive = false;
+    digitalWrite(MOSFET_GATE, LOW);
+    break;
+  case hprc::Command_StartEstimator:
+    Log.infoln("Start estimator flag set");
+    ctx.commands.estimatorRequested = true;
+    break;
+  case hprc::Command_Abort:
+    Log.infoln("Abort flag set");
+    ctx.commands.abortRequested = true;
+    break;
+  default:
+    Log.warningln("radio: ignoring unhandled command %d", (int)command);
+    break;
+  }
+}
+
+void handleRemoteCommands(uint8_t *rxBuff, size_t rxBuffLen) {
+  // The radio runs in broadcast mode and every node frames its packets with the
+  // same "KV0R" callsign, so the RX buffer fills with telemetry frames from
+  // other nodes as well as the commands meant for us. The buffer drops its
+  // oldest bytes when full, so if we only consumed one frame per loop a flood
+  // of telemetry would push commands out before we read them. Drain everything
+  // currently buffered each call, keeping only RemoteControl packets. The
+  // iteration cap stops a continuous stream from starving the main loop.
+  for (int processed = 0; processed < 16 && ctx.radio.hasMessage(); processed++) {
+    uint8_t messageLength = 0;
+    if (!ctx.radio.getMessage(rxBuff, rxBuffLen, messageLength) || messageLength == 0) {
+      break;
+    }
+
+    flatbuffers::Verifier verifier(rxBuff, messageLength);
+    if (!hprc::VerifyPacketBuffer(verifier)) {
+      // Likely a false frame sync: the bytes "KV0R" can appear inside binary
+      // telemetry payloads. Expected noise on a shared link, so log at trace.
+      Log.traceln("radio: skipped unverifiable frame (%d bytes)", messageLength);
+    } else {
+      const hprc::Packet *packet = hprc::GetPacket(rxBuff);
+      if (packet->packet_type() != hprc::PacketUnion_RemoteControl) {
+        // A valid packet, but telemetry from another node, not a command for us.
+        Log.traceln("radio: ignoring non-command packet (type %d)",
+                    (int)packet->packet_type());
+      } else {
+        const hprc::RemoteControlCommand *cmd = packet->packet_as_RemoteControl();
+        uint16_t cmdNum = cmd->command_number();
+        if (cmdNum != ctx.commands.lastCommandNumber) { // skip duplicates
+          ctx.commands.lastCommandNumber = cmdNum;
+          Log.infoln("radio: command #%u -> %s", cmdNum,
+                     hprc::EnumNameCommand(cmd->command()));
+          applyRemoteCommand(cmd->command());
+        }
+      }
+    }
+
+    // Re-scan the buffer so the next hasMessage()/getMessage() targets the
+    // following frame rather than re-reading stale state from this one.
+    ctx.radio.update();
+  }
+}
+
 void radioLoop() {
   static flatbuffers::FlatBufferBuilder builder;
   static uint8_t rxBuff[1024];
-  static uint16_t lastCmdNum = 0;
   static uint32_t lastRadioSendTime = 0;
   static uint32_t loopCount = 0;
 
+  // get new messages if there are any
   ctx.radio.update();
+
+  // check for remote commands and apply any we received
+  handleRemoteCommands(rxBuff, sizeof(rxBuff));
 
   if (millis() - lastRadioSendTime >= 200) {
     lastRadioSendTime = millis();
@@ -198,7 +284,7 @@ void radioLoop() {
 
     hprc::Shared sharedData;
     sharedData.mutate_time_from_boot(millis());
-    sharedData.mutate_last_command_received(lastCmdNum);
+    sharedData.mutate_last_command_received(ctx.commands.lastCommandNumber);
     sharedData.mutate_sd_file_no(ctx.logFileIdx);
     sharedData.mutate_loop_count(loopCount);
 
@@ -322,7 +408,7 @@ void setup() {
   digitalWrite(LED_RED, HIGH);
 
   Serial.begin(115200);
-  // radioInit();
+  radioInit();
 
   #ifdef DEBUG
     // check that delays are right
@@ -402,10 +488,36 @@ void velocityLoop(Context *ctx) {
   }
 }
 
+StateID applyCommandEffects(StateID proposedState) {
+  if (ctx.commands.estimatorRequested) {
+    ctx.commands.estimatorRequested = false;
+    ctx.ekfLooping = true;
+    Log.infoln("Estimator Requested!");
+  }
+
+  // its so over
+  if (ctx.commands.abortRequested) {
+    ctx.commands.abortRequested = false;
+    Log.infoln("Abort Requested!");
+    return ABORT;
+  }
+
+  // reset, back to no arm prelaunch
+  if (ctx.commands.resetRequested) {
+    ctx.commands.resetRequested = false;
+    ctx.commands.armed = false;
+    Log.infoln("Reset Requested!");
+    return PRELAUNCH;
+  }
+
+  return proposedState;
+}
+
 void loop() {
 
   updateStateData(&data);
   StateID newState = (*loopFuncs[ctx.currentState])(&data, &ctx, stateLocalData);
+  newState = applyCommandEffects(newState);
 
   if (ctx.currentState != newState) {
     initStateData(&data);
@@ -423,6 +535,6 @@ void loop() {
   estimatorLoop(&ctx);
   velocityLoop(&ctx);
 
-  // radioLoop();
+  radioLoop();
   loggingLoop(&ctx);
 }
