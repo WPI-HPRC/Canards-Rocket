@@ -36,6 +36,20 @@ struct INA219Data;
 
 #define LOG_FILE_BUFFER_SIZE 16000
 
+struct RemoteCommandState {
+    // last applied command
+    uint16_t lastCommandNumber = 0;
+
+    // latched
+    bool armed = true;
+    bool remoteStartActive = false;
+
+    // one shot
+    bool estimatorRequested = false;
+    bool abortRequested = false;
+    bool resetRequested = false;
+};
+
 struct Context {
     File logFile;
     File debugLogFile;
@@ -57,6 +71,10 @@ struct Context {
     MAX10S gps;
 
     LoRaE22 radio;
-    
+
+    RemoteCommandState commands;
+
     SplitStateEstimator estimator;
+
+    uint32_t liveVideoStart;
 };
