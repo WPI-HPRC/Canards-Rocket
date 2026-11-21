@@ -146,7 +146,6 @@ void applyRemoteCommand(hprc::Command command) {
   case hprc::Command_RemoteStartOn:
     Log.infoln("Remote start on flag set");
     ctx.commands.remoteStartActive = true;
-    ctx.liveVideoStart = millis();
     digitalWrite(MOSFET_GATE, HIGH);
     break;
   case hprc::Command_RemoteStartOff:
